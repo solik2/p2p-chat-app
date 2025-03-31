@@ -5,7 +5,10 @@ import logging
 from datetime import datetime
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -23,9 +26,11 @@ def cleanup_stale_entries():
     ]
     for username in stale_users:
         del registry[username]
+        logger.info(f"Removed stale entry for user: {username}")
 
 @app.route('/')
 def home():
+    cleanup_stale_entries()
     return jsonify({
         'status': 'running',
         'active_peers': len(registry),
@@ -107,4 +112,5 @@ def list_peers():
 if __name__ == '__main__':
     # Get port from environment variable (for cloud deployment) or use default
     port = int(os.environ.get('PORT', 5000))
+    logger.info(f"Starting server on port {port}")
     app.run(host='0.0.0.0', port=port) 
