@@ -39,9 +39,14 @@ def listen_for_messages(udp_socket):
     while True:
         try:
             data, addr = udp_socket.recvfrom(1024)
-            if data == b'KEEPALIVE' or data == b'PUNCH':
+            message = data.decode()
+            if message == 'KEEPALIVE' or message == 'PUNCH':
+                # Send acknowledgment for connection establishment
+                udp_socket.sendto(b'ACK', addr)
                 continue
-            print(f"\n[Message from {addr}]: {data.decode()}")
+            elif message == 'ACK':
+                continue
+            print(f"\n[Message from {addr}]: {message}")
             print("> ", end='', flush=True)
         except Exception as e:
             print("Error receiving message:", e)
@@ -57,21 +62,94 @@ def send_keepalive(udp_socket, peer_endpoint):
             print("Keep-alive error:", e)
             break
 
-def check_server_status():
-    try:
-        r = requests.get(SERVER_URL)
-        r.raise_for_status()
-        print("Server status:", r.json())
-        return True
-    except Exception as e:
-        print(f"Error checking server status: {e}")
-        return False
+def register_with_server(username, ip, port):
+    """Register with the server and handle retries"""
+    max_retries = 3
+    retry_delay = 2  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            payload = {
+                'username': username,
+                'ip': ip,
+                'port': port
+            }
+            r = requests.post(f"{SERVER_URL}/register", json=payload)
+            r.raise_for_status()
+            print("Successfully registered with rendezvous server.")
+            print(f"Active peers: {r.json().get('active_peers', 0)}")
+            return True
+        except requests.exceptions.RequestException as e:
+            print(f"Registration attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print("Registration failed after all attempts.")
+                return False
+
+def discover_peer(target_username, max_attempts=30, delay=2):
+    """Discover peer with retry logic"""
+    print(f"Looking for peer {target_username}...")
+    
+    for attempt in range(max_attempts):
+        try:
+            r = requests.get(f"{SERVER_URL}/get_peer/{target_username}")
+            if r.status_code == 200:
+                peer_info = r.json()
+                return (peer_info['ip'], peer_info['port'])
+            elif r.status_code == 404:
+                if attempt < max_attempts - 1:
+                    print(f"Peer not found. Retrying in {delay} seconds... (attempt {attempt + 1}/{max_attempts})")
+                    time.sleep(delay)
+                continue
+            else:
+                r.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            print(f"Error contacting rendezvous server: {e}")
+            if attempt < max_attempts - 1:
+                time.sleep(delay)
+            continue
+    
+    return None
+
+def establish_connection(udp_socket, peer_endpoint):
+    """Establish connection with peer using UDP hole punching"""
+    print("\nInitiating UDP hole punching...")
+    connection_established = False
+    
+    for i in range(config['client']['punch_attempts']):
+        try:
+            udp_socket.sendto(b'PUNCH', peer_endpoint)
+            # Set a timeout for receiving ACK
+            udp_socket.settimeout(1)
+            try:
+                data, addr = udp_socket.recvfrom(1024)
+                if data.decode() == 'ACK':
+                    print("Connection established!")
+                    connection_established = True
+                    break
+            except socket.timeout:
+                pass
+        except Exception as e:
+            print(f"Error during hole punching: {e}")
+        
+        if i < config['client']['punch_attempts'] - 1:
+            time.sleep(config['client']['punch_interval'])
+    
+    # Reset socket timeout
+    udp_socket.settimeout(None)
+    return connection_established
 
 def main():
     print(f"Connecting to rendezvous server at {SERVER_URL}")
     
-    if not check_server_status():
-        print("Failed to connect to the server. Please try again later.")
+    try:
+        r = requests.get(SERVER_URL)
+        r.raise_for_status()
+        print("Server status:", r.json())
+    except Exception as e:
+        print(f"Error checking server status: {e}")
         return
 
     username = input("Enter your username: ").strip()
@@ -91,47 +169,41 @@ def main():
     if public_port == 0:
         public_port = local_port
 
-    # Register our public endpoint with the rendezvous server.
-    payload = {
-        'username': username,
-        'ip': public_ip,
-        'port': public_port
-    }
-    try:
-        r = requests.post(f"{SERVER_URL}/register", json=payload)
-        r.raise_for_status()  # Raise an exception for bad status codes
-        print("Successfully registered with rendezvous server.")
-        print(f"Active peers: {r.json().get('active_peers', 0)}")
-    except requests.exceptions.RequestException as e:
-        print(f"Error connecting to rendezvous server: {e}")
+    # Register with the server
+    if not register_with_server(username, public_ip, public_port):
         return
 
-    # Retrieve the target peer's public endpoint from the server.
-    try:
-        r = requests.get(f"{SERVER_URL}/get_peer/{target_username}")
-        r.raise_for_status()  # Raise an exception for bad status codes
-        peer_info = r.json()
-        peer_endpoint = (peer_info['ip'], peer_info['port'])
-        print(f"Target peer endpoint: {peer_endpoint}")
-    except requests.exceptions.RequestException as e:
-        print(f"Error contacting rendezvous server: {e}")
+    # Start registration refresh thread
+    def refresh_registration():
+        while True:
+            time.sleep(240)  # Refresh every 4 minutes
+            register_with_server(username, public_ip, public_port)
+    
+    refresh_thread = threading.Thread(target=refresh_registration, daemon=True)
+    refresh_thread.start()
+
+    # Discover peer with retry
+    peer_endpoint = discover_peer(target_username)
+    if not peer_endpoint:
+        print(f"Failed to find peer {target_username} after multiple attempts.")
         return
+
+    print(f"Found peer endpoint: {peer_endpoint}")
 
     # Start a listener thread to receive messages
     listener_thread = threading.Thread(target=listen_for_messages, args=(udp_socket,), daemon=True)
     listener_thread.start()
 
+    # Establish connection
+    if not establish_connection(udp_socket, peer_endpoint):
+        print("Failed to establish connection with peer.")
+        return
+
     # Start a keep-alive thread to maintain NAT bindings
     ka_thread = threading.Thread(target=send_keepalive, args=(udp_socket, peer_endpoint), daemon=True)
     ka_thread.start()
 
-    # Begin UDP hole punching: send several initial packets to the peer.
-    print("Initiating UDP hole punching...")
-    for i in range(config['client']['punch_attempts']):
-        udp_socket.sendto(b'PUNCH', peer_endpoint)
-        time.sleep(config['client']['punch_interval'])
-
-    print("\nYou can now start chatting. Type your messages and press enter.")
+    print("\nConnection established! You can now start chatting.")
     print("Press Ctrl+C to exit.")
     while True:
         try:
