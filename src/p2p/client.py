@@ -116,25 +116,45 @@ def discover_peer(target_username, max_attempts=30, delay=2):
 def establish_connection(udp_socket, peer_endpoint):
     """Establish connection with peer using UDP hole punching"""
     print("\nInitiating UDP hole punching...")
+    print(f"Local endpoint: {udp_socket.getsockname()}")
+    print(f"Attempting to connect to peer at: {peer_endpoint}")
     connection_established = False
     
+    # Send initial burst of packets
+    for _ in range(5):
+        udp_socket.sendto(b'PUNCH', peer_endpoint)
+        time.sleep(0.1)
+    
+    # Main connection loop
     for i in range(config['client']['punch_attempts']):
         try:
+            print(f"Connection attempt {i+1}/{config['client']['punch_attempts']}")
             udp_socket.sendto(b'PUNCH', peer_endpoint)
-            # Set a timeout for receiving ACK
-            udp_socket.settimeout(1)
-            try:
-                data, addr = udp_socket.recvfrom(1024)
-                if data.decode() == 'ACK':
-                    print("Connection established!")
-                    connection_established = True
-                    break
-            except socket.timeout:
-                pass
+            
+            # Try to receive for 2 seconds
+            udp_socket.settimeout(2)
+            start_time = time.time()
+            while time.time() - start_time < 2:
+                try:
+                    data, addr = udp_socket.recvfrom(1024)
+                    print(f"Received {data.decode()} from {addr}")
+                    if data.decode() == 'ACK' or data.decode() == 'PUNCH':
+                        if data.decode() == 'PUNCH':
+                            udp_socket.sendto(b'ACK', addr)
+                        print(f"Connection established with {addr}!")
+                        connection_established = True
+                        break
+                except socket.timeout:
+                    continue
+                
+            if connection_established:
+                break
+                
         except Exception as e:
             print(f"Error during hole punching: {e}")
         
-        if i < config['client']['punch_attempts'] - 1:
+        if i < config['client']['punch_attempts'] - 1 and not connection_established:
+            print(f"Retrying in {config['client']['punch_interval']} seconds...")
             time.sleep(config['client']['punch_interval'])
     
     # Reset socket timeout
@@ -157,17 +177,19 @@ def main():
 
     # Discover public IP, port, and NAT type using STUN
     public_ip, public_port, nat_type = get_public_endpoint()
-    print(f"Discovered endpoint: {public_ip}:{public_port} (NAT type: {nat_type})")
+    print(f"Public endpoint: {public_ip}:{public_port}")
+    print(f"NAT type: {nat_type}")
 
     # Create a UDP socket and bind it to an available local port.
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_socket.bind(('', 0))
     local_port = udp_socket.getsockname()[1]
-    print(f"Local UDP socket bound on port {local_port}")
+    print(f"Local UDP socket bound to: {udp_socket.getsockname()}")
 
     # If STUN failed to get a port, use the local port
     if public_port == 0:
         public_port = local_port
+        print("Using local port as public port")
 
     # Register with the server
     if not register_with_server(username, public_ip, public_port):
