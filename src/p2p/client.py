@@ -19,22 +19,56 @@ if (not config['server']['use_https'] and config['server']['port'] != 80) or \
     SERVER_URL += f":{config['server']['port']}"
 
 def get_public_endpoint():
-    try:
-        # Uses the STUN library to determine public endpoint and NAT type.
-        nat_type, external_ip, external_port = stun.get_ip_info(
-            stun_host=config['stun']['server'],
-            stun_port=config['stun']['port']
-        )
-        if not external_ip or not external_port:
-            # If STUN fails, use local IP as fallback for testing
-            external_ip = socket.gethostbyname(socket.gethostname())
-            external_port = 0  # Let the OS choose a port
-        print(f"STUN server used: {config['stun']['server']}:{config['stun']['port']}")
-        return external_ip, external_port, nat_type
-    except Exception as e:
-        print(f"STUN error: {e}")
-        # Fallback to local IP for testing
-        return socket.gethostbyname(socket.gethostname()), 0, "Unknown"
+    """Get public endpoint using multiple STUN servers"""
+    results = []
+    
+    for stun_server in config['stun']['servers']:
+        try:
+            print(f"\nTrying STUN server: {stun_server['host']}:{stun_server['port']}")
+            nat_type, external_ip, external_port = stun.get_ip_info(
+                stun_host=stun_server['host'],
+                stun_port=stun_server['port']
+            )
+            if external_ip and external_port:
+                results.append({
+                    'nat_type': nat_type,
+                    'ip': external_ip,
+                    'port': external_port,
+                    'server': stun_server['host']
+                })
+                print(f"✓ Success: {nat_type} NAT, endpoint: {external_ip}:{external_port}")
+            else:
+                print(f"✗ Failed: No endpoint received")
+        except Exception as e:
+            print(f"✗ Error with {stun_server['host']}: {e}")
+    
+    if not results:
+        print("\n⚠️ All STUN servers failed. Falling back to local IP")
+        local_ip = socket.gethostbyname(socket.gethostname())
+        return local_ip, 0, "Unknown"
+    
+    # Analyze results
+    nat_types = set(r['nat_type'] for r in results)
+    ips = set(r['ip'] for r in results)
+    
+    print("\nNAT Analysis:")
+    print(f"Detected NAT types: {', '.join(nat_types)}")
+    print(f"Detected IPs: {', '.join(ips)}")
+    
+    # Use the most common result
+    from collections import Counter
+    ip_counter = Counter(r['ip'] for r in results)
+    most_common_ip = ip_counter.most_common(1)[0][0]
+    
+    # Find the corresponding port for the most common IP
+    for r in results:
+        if r['ip'] == most_common_ip:
+            print(f"\nSelected endpoint: {r['ip']}:{r['port']} (NAT: {r['nat_type']})")
+            return r['ip'], r['port'], r['nat_type']
+    
+    # Fallback to first result if no common IP found
+    print(f"\nFalling back to first valid result")
+    return results[0]['ip'], results[0]['port'], results[0]['nat_type']
 
 def listen_for_messages(udp_socket):
     while True:
@@ -132,63 +166,83 @@ def create_socket():
     return udp_socket
 
 def establish_connection(udp_socket, peer_endpoint):
-    """Establish connection with peer using UDP hole punching"""
-    print("\nInitiating UDP hole punching...")
+    """Establish connection with peer using simultaneous UDP hole punching"""
+    print("\nInitiating simultaneous UDP hole punching...")
     print(f"Local endpoint: {udp_socket.getsockname()}")
-    print(f"Attempting to connect to peer at: {peer_endpoint}")
+    print(f"Peer endpoint: {peer_endpoint}")
+    
+    if config['client'].get('cgnat_mode', False):
+        print("CGNAT mode enabled - using aggressive hole punching")
+    
     connection_established = False
+    received_punch = False
+    sent_punch = False
     
-    # Initial burst of packets (more aggressive)
-    for _ in range(10):
-        try:
-            udp_socket.sendto(b'PUNCH', peer_endpoint)
-            time.sleep(0.05)  # Shorter delay between initial bursts
-        except Exception as e:
-            print(f"Error sending initial burst: {e}")
-    
-    # Main connection loop with longer timeout
-    for i in range(config['client']['punch_attempts']):
-        try:
-            print(f"Connection attempt {i+1}/{config['client']['punch_attempts']}")
-            
-            # Send multiple PUNCH packets
-            for _ in range(3):
+    def send_punch_packets():
+        """Send burst of punch packets"""
+        for _ in range(5):
+            try:
                 udp_socket.sendto(b'PUNCH', peer_endpoint)
-                time.sleep(0.1)
+                time.sleep(0.05)
+            except Exception as e:
+                print(f"Error sending punch packet: {e}")
+    
+    # Start with aggressive burst
+    send_punch_packets()
+    
+    # Main connection loop
+    start_time = time.time()
+    while time.time() - start_time < config['client']['punch_timeout']:
+        try:
+            # Send periodic punch packets
+            if time.time() - start_time > 2 and not sent_punch:  # After 2 seconds
+                print("Sending additional punch packets...")
+                send_punch_packets()
+                sent_punch = True
             
-            # Try to receive for 5 seconds (increased from 2)
-            udp_socket.settimeout(5)
-            start_time = time.time()
-            
-            while time.time() - start_time < 5:
-                try:
-                    data, addr = udp_socket.recvfrom(4096)  # Increased buffer size
-                    print(f"Received {data.decode()} from {addr}")
-                    
-                    if data.decode() == 'ACK' or data.decode() == 'PUNCH':
-                        # Always respond with ACK to any received packet
-                        udp_socket.sendto(b'ACK', addr)
-                        print(f"Connection established with {addr}!")
-                        connection_established = True
-                        break
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    print(f"Error during receive: {e}")
-            
-            if connection_established:
-                break
+            # Try to receive
+            udp_socket.settimeout(1)
+            try:
+                data, addr = udp_socket.recvfrom(4096)
+                message = data.decode()
+                print(f"Received {message} from {addr}")
                 
+                if message == 'PUNCH':
+                    print("Received PUNCH - sending ACK")
+                    udp_socket.sendto(b'ACK', addr)
+                    received_punch = True
+                elif message == 'ACK':
+                    print("Received ACK - connection established!")
+                    connection_established = True
+                    break
+                
+                # In CGNAT mode, consider connection established if we've both sent and received packets
+                if config['client'].get('cgnat_mode', False) and received_punch and sent_punch:
+                    print("CGNAT: Bidirectional communication established!")
+                    connection_established = True
+                    break
+                
+            except socket.timeout:
+                continue
+            
         except Exception as e:
             print(f"Error during hole punching: {e}")
-        
-        if i < config['client']['punch_attempts'] - 1 and not connection_established:
-            wait_time = config['client']['punch_interval'] * (i + 1)  # Progressive backoff
-            print(f"Retrying in {wait_time} seconds...")
-            time.sleep(wait_time)
+            time.sleep(0.5)
     
     # Reset socket timeout
     udp_socket.settimeout(None)
+    
+    if connection_established:
+        print("\n✓ P2P Connection established successfully!")
+    else:
+        print("\n✗ Failed to establish P2P connection")
+        if received_punch:
+            print("  → Received PUNCH but no ACK")
+        elif sent_punch:
+            print("  → Sent PUNCH but no response")
+        else:
+            print("  → No packets exchanged")
+    
     return connection_established
 
 def main():

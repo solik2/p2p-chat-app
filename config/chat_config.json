@@ -5,13 +5,31 @@
         "use_https": true
     },
     "stun": {
-        "server": "stun.l.google.com",
-        "port": 19302
+        "servers": [
+            {
+                "host": "stun.l.google.com",
+                "port": 19302
+            },
+            {
+                "host": "stun1.l.google.com",
+                "port": 19302
+            },
+            {
+                "host": "stun2.l.google.com",
+                "port": 19302
+            },
+            {
+                "host": "stun.stunprotocol.org",
+                "port": 3478
+            }
+        ]
     },
     "client": {
-        "keepalive_interval": 20,
-        "punch_attempts": 5,
+        "punch_attempts": 20,
         "punch_interval": 1,
-        "registration_timeout": 300
+        "punch_timeout": 10,
+        "keepalive_interval": 15,
+        "simultaneous_punch": true,
+        "cgnat_mode": true
     }
 }
