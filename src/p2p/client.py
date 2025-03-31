@@ -29,6 +29,7 @@ def get_public_endpoint():
             # If STUN fails, use local IP as fallback for testing
             external_ip = socket.gethostbyname(socket.gethostname())
             external_port = 0  # Let the OS choose a port
+        print(f"STUN server used: {config['stun']['server']}:{config['stun']['port']}")
         return external_ip, external_port, nat_type
     except Exception as e:
         print(f"STUN error: {e}")
@@ -113,6 +114,23 @@ def discover_peer(target_username, max_attempts=30, delay=2):
     
     return None
 
+def create_socket():
+    """Create and configure UDP socket for P2P communication"""
+    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    # Enable broadcasting and reuse address
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    # Increase socket buffers for better performance
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+    udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+    
+    # Bind to all interfaces but with a specific port
+    udp_socket.bind(('', 0))
+    
+    return udp_socket
+
 def establish_connection(udp_socket, peer_endpoint):
     """Establish connection with peer using UDP hole punching"""
     print("\nInitiating UDP hole punching...")
@@ -120,33 +138,44 @@ def establish_connection(udp_socket, peer_endpoint):
     print(f"Attempting to connect to peer at: {peer_endpoint}")
     connection_established = False
     
-    # Send initial burst of packets
-    for _ in range(5):
-        udp_socket.sendto(b'PUNCH', peer_endpoint)
-        time.sleep(0.1)
+    # Initial burst of packets (more aggressive)
+    for _ in range(10):
+        try:
+            udp_socket.sendto(b'PUNCH', peer_endpoint)
+            time.sleep(0.05)  # Shorter delay between initial bursts
+        except Exception as e:
+            print(f"Error sending initial burst: {e}")
     
-    # Main connection loop
+    # Main connection loop with longer timeout
     for i in range(config['client']['punch_attempts']):
         try:
             print(f"Connection attempt {i+1}/{config['client']['punch_attempts']}")
-            udp_socket.sendto(b'PUNCH', peer_endpoint)
             
-            # Try to receive for 2 seconds
-            udp_socket.settimeout(2)
+            # Send multiple PUNCH packets
+            for _ in range(3):
+                udp_socket.sendto(b'PUNCH', peer_endpoint)
+                time.sleep(0.1)
+            
+            # Try to receive for 5 seconds (increased from 2)
+            udp_socket.settimeout(5)
             start_time = time.time()
-            while time.time() - start_time < 2:
+            
+            while time.time() - start_time < 5:
                 try:
-                    data, addr = udp_socket.recvfrom(1024)
+                    data, addr = udp_socket.recvfrom(4096)  # Increased buffer size
                     print(f"Received {data.decode()} from {addr}")
+                    
                     if data.decode() == 'ACK' or data.decode() == 'PUNCH':
-                        if data.decode() == 'PUNCH':
-                            udp_socket.sendto(b'ACK', addr)
+                        # Always respond with ACK to any received packet
+                        udp_socket.sendto(b'ACK', addr)
                         print(f"Connection established with {addr}!")
                         connection_established = True
                         break
                 except socket.timeout:
                     continue
-                
+                except Exception as e:
+                    print(f"Error during receive: {e}")
+            
             if connection_established:
                 break
                 
@@ -154,8 +183,9 @@ def establish_connection(udp_socket, peer_endpoint):
             print(f"Error during hole punching: {e}")
         
         if i < config['client']['punch_attempts'] - 1 and not connection_established:
-            print(f"Retrying in {config['client']['punch_interval']} seconds...")
-            time.sleep(config['client']['punch_interval'])
+            wait_time = config['client']['punch_interval'] * (i + 1)  # Progressive backoff
+            print(f"Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
     
     # Reset socket timeout
     udp_socket.settimeout(None)
@@ -180,9 +210,8 @@ def main():
     print(f"Public endpoint: {public_ip}:{public_port}")
     print(f"NAT type: {nat_type}")
 
-    # Create a UDP socket and bind it to an available local port.
-    udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_socket.bind(('', 0))
+    # Create and configure UDP socket
+    udp_socket = create_socket()
     local_port = udp_socket.getsockname()[1]
     print(f"Local UDP socket bound to: {udp_socket.getsockname()}")
 
