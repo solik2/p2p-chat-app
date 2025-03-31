@@ -1,0 +1,17 @@
+{
+    "server": {
+        "host": "p2p-chat-server.onrender.com",
+        "port": 443,
+        "use_https": true
+    },
+    "stun": {
+        "server": "stun.l.google.com",
+        "port": 19302
+    },
+    "client": {
+        "keepalive_interval": 20,
+        "punch_attempts": 5,
+        "punch_interval": 1,
+        "registration_timeout": 300
+    }
+}
